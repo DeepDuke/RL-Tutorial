@@ -61,6 +61,7 @@ if __name__ == '__main__':
         action = int(optimal_policy[observation])  # your agent here (this takes random actions)
         observation, reward, done, info = env.step(action)
         sleep(1)
+        print('Current step reward: {}'.format(reward))
         if done:
             print('Game Finished!')
             observation = env.reset()
