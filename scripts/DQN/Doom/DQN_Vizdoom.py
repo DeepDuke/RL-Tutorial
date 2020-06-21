@@ -343,6 +343,7 @@ if __name__ == '__main__':
             # Optimize
             loss.backward()
             optimizer.step()
+
 # TODO: To convert numpy image and variable to torch Tensor
 # TODO: To add tensorboard summary
 # TODO: To add testing code
