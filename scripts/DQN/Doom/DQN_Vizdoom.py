@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+
+import os
 import numpy as np
 from vizdoom import *  # Game Doom environment
 import time
@@ -8,13 +11,13 @@ import random
 from skimage import transform
 from collections import deque
 from matplotlib import pyplot as plt
+from tabulate import tabulate
 import warnings
 warnings.filterwarnings('ignore')
 
 
 def create_environment():
     game = DoomGame()
-
     # Load the correct configuration
     game.load_config("basic.cfg")
 
@@ -71,7 +74,7 @@ action_size = game.get_available_buttons_size()              # 3 possible action
 learning_rate = 0.0002      # Alpha (aka learning rate)
 
 # Training parameters
-total_episodes = 500        # Total episodes for training
+total_episodes = 10000       # Total episodes for training
 max_steps = 100              # Max possible steps in an episode
 batch_size = 64
 
@@ -92,6 +95,10 @@ training = True
 
 # TURN THIS TO TRUE IF YOU WANT TO RENDER THE ENVIRONMENT
 episode_render = False
+
+# Summary writer
+writer = SummaryWriter('./summary')
+
 
 def preprocess_frame(frame):
     # Greyscale frame already done in our vizdoom config
@@ -132,6 +139,7 @@ def stack_frames(stacked_frames, state, is_new_episode):
 
         # Build the stacked state (first dimension specifies different frames)
         stacked_state = np.stack(stacked_frames, axis=2)
+    stacked_state = stacked_state.transpose((2, 0, 1))
 
     return stacked_state, stacked_frames
 
@@ -143,22 +151,19 @@ class DQN(nn.Module):
         self.conv1 = nn.Sequential(
             nn.Conv2d(in_channels=4, out_channels=32, kernel_size=8, stride=4, padding=0),
             nn.BatchNorm2d(32),
-            nn.ELU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)
+            nn.ELU()
         )
         # conv1 out: [None, 20, 20, 32]
         self.conv2 = nn.Sequential(
             nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2, padding=0),
             nn.BatchNorm2d(64),
-            nn.ELU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)
+            nn.ELU()
         )
         # conv2 out: [None, 9, 9, 64]
         self.conv3 = nn.Sequential(
             nn.Conv2d(in_channels=64, out_channels=128, kernel_size=4, stride=2, padding=0),
             nn.BatchNorm2d(128),
-            nn.ELU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)
+            nn.ELU()
         )
         # conv3 out: [None, 3, 3, 128]
         self.fc1 = nn.Linear(3*3*128, 512)
@@ -166,11 +171,18 @@ class DQN(nn.Module):
 
     def forward(self, x):
         output = self.conv1(x)
+        # print('image shape after conv1: ', output.shape)
         output = self.conv2(output)
+        # print('image shape after conv2: ', output.shape)
         output = self.conv3(output)
+        # print('image shape after conv3: ', output.shape)
         output = output.view(-1, 3*3*128)  # flatten
+        # print('image shape after flatten: ', output.shape)
         output = self.fc1(output)
+        # print('image shape after fc1: ', output.shape)
         output = self.fc2(output)
+        # print('image shape after fc2: ', output.shape)
+        return output
 
 
 class Memory:
@@ -196,6 +208,7 @@ game.new_episode()
 
 for i in range(pretrain_length):
     # If it's the first step
+    print('Pre Memory step #{}'.format(i))
     if i == 0:
         # First we need a state
         state = game.get_state().screen_buffer
@@ -250,7 +263,7 @@ if __name__ == '__main__':
     model = DQN().to(device)
     criterion = nn.MSELoss().to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-
+    print('Starting Training ...')
     for episode in range(total_episodes):
         step = 0
         episode_rewards = []
@@ -258,7 +271,9 @@ if __name__ == '__main__':
         game.new_episode()
         state = game.get_state().screen_buffer
         state, stacked_frames = stack_frames(stacked_frames, state, True)
+        print('Running Episode #{}'.format(episode))
         while step < max_steps:
+            # print('Episode #{} --- step #{}'.format(episode, step))
             # INTERACTION PART
             step += 1
             decay_step += 1
@@ -269,9 +284,12 @@ if __name__ == '__main__':
                 action = random.choice(possible_actions)
             else:  # choose a highest q value action to exploit
                 model.eval()
-                Q_predict = model(state)
-                choice = np.argmax(Q_predict)
-                action = possible_actions[int(choice)]
+                with torch.no_grad():
+                    state = state[np.newaxis, :]
+                    # print('state shape:', state.shape)
+                    Q_predict = model(torch.from_numpy(state).to(device, dtype=torch.float))  # convert numpy array to torch tensor
+                    choice = torch.argmax(Q_predict).item()  # convert torch tensor back to numpy
+                    action = possible_actions[int(choice)]
 
             # Do the action
             reward = game.make_action(action)
@@ -291,10 +309,9 @@ if __name__ == '__main__':
                 step = max_steps
 
                 # Get the total reward of the episode
-                total_reward = np.sum(episode_rewards)
-
+                # total_reward = np.sum(episode_rewards)
+                # print("Episode #{} Rewards: --- {:.4f}".format(episode, total_reward))
                 memory.add((state, action, reward, next_state, done))
-
             else:
                 # Get the next state
                 next_state = game.get_state().screen_buffer
@@ -308,9 +325,6 @@ if __name__ == '__main__':
                 # st+1 is now our current state
                 state = next_state
 
-            # LEARNING PART
-            model.train()
-            optimizer.zero_grad()
             # Obtain random mini-batch from memory
             batch = memory.sample(batch_size)
             states_mb = np.array([each[0] for each in batch], ndmin=3)
@@ -320,32 +334,58 @@ if __name__ == '__main__':
             dones_mb = np.array([each[4] for each in batch])
             # Compute Q target
             target_Qs_batch = []
-            Qs_next_state = model(next_states_mb)
+            # model.eval()
+            # with torch.no_grad():
+
+            # LEARNING PART
+            model.train()
+            optimizer.zero_grad()
+
+            Qs_next_state = model(torch.from_numpy(next_states_mb).to(device, dtype=torch.float))
+
             for i in range(0, len(batch)):
                 terminal = dones_mb[i]
-
                 # If we are in a terminal state, only equals reward
                 if terminal:
-                    target_Qs_batch.append(rewards_mb[i])
-
+                    target_Qs_batch.append(torch.from_numpy(np.array([rewards_mb[i]])).to(device, dtype=torch.float).item())
                 else:
-                    target = rewards_mb[i] + gamma * np.max(Qs_next_state[i])
-                    target_Qs_batch.append(target)
-            targets_mb = np.array([each for each in target_Qs_batch])
+                    target = torch.from_numpy(np.array([rewards_mb[i]])).to(device, dtype=torch.float) + \
+                             gamma * torch.max(Qs_next_state[i])
+                    target_Qs_batch.append(target.item())
+            # print('target_Qs_batch:', target_Qs_batch)
+            targets_mb = np.array(target_Qs_batch)
             # Compute Q estimate
             estimates_Qs_batch = []
+            Qs_state = model(torch.from_numpy(next_states_mb).to(device, dtype=torch.float))
             for i in range(0, len(batch)):
-                output = model(states_mb[i])*actions_mb[i]
-                estimates_Qs_batch.append(output)
+                output = torch.matmul(Qs_state[i], torch.from_numpy(actions_mb[i]).to(device, dtype=torch.float))
+                estimates_Qs_batch.append(output.item())
             estimates_mb = np.array([each for each in estimates_Qs_batch])
             # Compute loss
-            loss = criterion(estimates_mb, targets_mb)
+            # print('estimates_mb:', estimates_mb.dtype)
+            # print('targets_mb:', targets_mb.dtype)
+            loss = criterion(torch.from_numpy(estimates_mb).to(device, dtype=torch.float),
+                             torch.from_numpy(targets_mb).to(device, dtype=torch.float).requires_grad_())
             # Optimize
             loss.backward()
             optimizer.step()
+            # Summary writer
+            if done or (step == max_steps-1):
+                writer.add_scalar('Show/Explore_probability', explore_probability, episode)
+                writer.add_scalar('Show/Loss', loss.item(), episode)
+                writer.add_scalar('Show/RewardsPerEpisode', np.sum(episode_rewards), episode)
+                table = [['Episode', 'Explore_probability', 'Loss', 'Rewards'],
+                         [episode, explore_probability, loss.item(), np.sum(episode_rewards)]]
+                # print('-' * 30)
+                print(tabulate(table, headers='firstrow', tablefmt='grid'))
+                # print('-' * 30)
+                # print("train loss: --- {:.4f}".format(loss.item()))
+            # Save model every  5 episode
+            if episode % 5 == 0:
+                saved_model_name = os.path.join('./model/model' + '_' + str(episode) + '.pt')
+                torch.save(model.state_dict(), saved_model_name)
 
-# TODO: To convert numpy image and variable to torch Tensor
-# TODO: To add tensorboard summary
+
 # TODO: To add testing code
 # TODO: To add argparse
 # TODO: To prettify the code
